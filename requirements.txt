@@ -1,0 +1,8 @@
+# Detection process (detection.py)
+opencv-python>=4.5
+numpy>=1.21
+PyAutoGUI>=0.9.53
+
+# Overlay process (overlay.py) — Windows only
+PyQt5>=5.15
+pywin32>=305

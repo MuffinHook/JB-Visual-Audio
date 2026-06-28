@@ -1,153 +1,167 @@
-import math
+"""Directional overlay renderer.
+
+Listens for detection state on a local UDP socket and draws a frameless,
+click-through, always-on-top overlay. Enemies are shown as coloured arcs on a
+guide ring whose angle is relative to the local player's heading, with brief
+pop-up arcs flagging newly appeared enemies.
+
+Windows only (relies on ``pywin32`` for click-through). Run with
+``python overlay.py``.
+"""
+
 import json
+import logging
+import math
 import socket
 import threading
 import time
+from collections import namedtuple
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 import win32con
 import win32gui
 
-UDP_HOST = "127.0.0.1"
-UDP_PORT = 50555
+import config
 
-RING_RADIUS = 140
-ARC_SPAN_DEG = 18
+log = logging.getLogger("overlay")
 
-# 25% transparent ring
-RING_ALPHA = 64
+# --- Guide ring / enemy indicators ------------------------------------------
+ringRadius = 140
+ringSpan = 18
+ringAlpha = 64  # 25% opaque guide ring.
 
-MIN_ALPHA = 90
-MAX_ALPHA = 255
-MIN_PEN = 4
-MAX_PEN = 10
-MAX_MAP_DIST = 120.0
+# Indicators fade and thin with distance, interpolated between these bounds.
+minAlpha = 90
+maxAlpha = 255
+minPen = 4
+maxPen = 10
+maxDist = 120.0
 
-POPUP_LIFETIME = 0.55
-POPUP_RADIUS = 155
-POPUP_SPAN_DEG = 22
-POPUP_PEN_WIDTH = 9
+# --- New-enemy pop-up arcs --------------------------------------------------
+popupLife = 0.55
+popupRadius = 155
+popupSpan = 22
+popupPen = 9
 
-TEAM_COLORS = {
-    "police": (42, 204, 255),
-    "criminal": (252, 40, 47),
-    "prisoner": (253, 123, 49),
-}
+# How long stale detection state is honoured before the overlay blanks out.
+staleAfter = 1.0
+# Default player position, used until detection reports one.
+home = {"x": 96, "y": 93}
 
+teamColors = config.teamColors
+
+# One enemy reduced to what we actually draw: a ring arc.
+Arc = namedtuple("Arc", "angle alpha width")
+
+# --- Shared state -----------------------------------------------------------
 state = {
     "team": None,
     "heading": None,
-    "player": {"x": 96, "y": 93},
+    "player": dict(home),
     "enemies": [],
     "timestamp": 0.0,
 }
-
 state_lock = threading.Lock()
+
 popups = []
 popup_lock = threading.Lock()
 
 
-def clamp(v, a, b):
-    return max(a, min(b, v))
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
-def angle_diff_signed(a, b):
+def signed_diff(a, b):
+    """Signed smallest difference between two angles (degrees)."""
     return (a - b + 180) % 360 - 180
 
 
-def enemy_to_indicator(enemy_x, enemy_y, player_x, player_y, heading_deg):
-    dx = enemy_x - player_x
-    dy = enemy_y - player_y
+def enemy_arc(ex, ey, px, py, heading):
+    """Reduce an enemy position to a heading-relative ring arc."""
+    dx = ex - px
+    dy = ey - py
 
     dist = math.hypot(dx, dy)
-    world_angle = (math.degrees(math.atan2(dy, dx)) + 90) % 360
-    rel_angle = angle_diff_signed(world_angle, heading_deg)
+    world = (math.degrees(math.atan2(dy, dx)) + 90) % 360
+    angle = signed_diff(world, heading)
 
-    t = 1.0 - clamp(dist / MAX_MAP_DIST, 0.0, 1.0)
-    alpha = int(MIN_ALPHA + (MAX_ALPHA - MIN_ALPHA) * t)
-    pen_width = int(MIN_PEN + (MAX_PEN - MIN_PEN) * t)
+    t = 1.0 - clamp(dist / maxDist, 0.0, 1.0)
+    alpha = int(minAlpha + (maxAlpha - minAlpha) * t)
+    width = int(minPen + (maxPen - minPen) * t)
 
-    return {
-        "relative_angle": rel_angle,
-        "distance": dist,
-        "alpha": alpha,
-        "pen_width": pen_width,
-    }
+    return Arc(angle, alpha, width)
 
 
-def guess_enemy_team(local_team):
-    if local_team == "police":
+def enemy_team(team):
+    """Map the local player's team to the team they see as enemies."""
+    if team == "police":
         return "criminal"
-    if local_team in ("criminal", "prisoner"):
+    if team in ("criminal", "prisoner"):
         return "police"
     return "criminal"
 
 
-def add_popup(relative_angle, team):
+def add_popup(angle, team):
     with popup_lock:
-        popups.append({
-            "relative_angle": relative_angle,
-            "team": team,
-            "created": time.time(),
-        })
+        popups.append({"angle": angle, "team": team, "born": time.time()})
 
 
 def cleanup_popups():
     now = time.time()
     with popup_lock:
-        popups[:] = [p for p in popups if now - p["created"] <= POPUP_LIFETIME]
+        popups[:] = [p for p in popups if now - p["born"] <= popupLife]
 
 
 def udp_listener():
+    """Receive detection packets, update shared state, and queue pop-ups."""
     global state
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_HOST, UDP_PORT))
+    sock.bind((config.udpHost, config.udpPort))
+    log.info("listening on %s:%s", config.udpHost, config.udpPort)
 
-    last_enemy_signature = set()
-
-    print(f"[Overlay] Listening on {UDP_HOST}:{UDP_PORT}")
+    last_seen = set()
 
     while True:
         try:
             data, _ = sock.recvfrom(65535)
             payload = json.loads(data.decode("utf-8"))
 
-            print(
-                f"[Overlay] Data received | "
-                f"Team: {payload.get('team')} | "
-                f"Heading: {payload.get('heading')} | "
-                f"Enemies: {len(payload.get('enemies', []))}"
+            log.debug(
+                "received | team=%s heading=%s enemies=%d",
+                payload.get("team"),
+                payload.get("heading"),
+                len(payload.get("enemies", [])),
             )
 
             heading = payload.get("heading")
             player = payload.get("player", {})
             enemies = payload.get("enemies", [])
-            local_team = payload.get("team")
+            team = payload.get("team")
 
-            px = player.get("x", 96)
-            py = player.get("y", 93)
+            px = player.get("x", home["x"])
+            py = player.get("y", home["y"])
 
-            new_signature = set()
+            seen = set()
             if heading is not None:
-                enemy_team = guess_enemy_team(local_team)
+                foe = enemy_team(team)
 
-                for enemy in enemies:
-                    ex = enemy["x"]
-                    ey = enemy["y"]
+                for e in enemies:
+                    key = (e["x"], e["y"])
+                    seen.add(key)
 
-                    sig = (ex, ey)
-                    new_signature.add(sig)
+                    # Flag enemies that were not present in the previous packet.
+                    if key not in last_seen:
+                        arc = enemy_arc(e["x"], e["y"], px, py, heading)
+                        add_popup(arc.angle, foe)
 
-                    if sig not in last_enemy_signature:
-                        ind = enemy_to_indicator(ex, ey, px, py, heading)
-                        add_popup(ind["relative_angle"], enemy_team)
-
-            last_enemy_signature = new_signature
+            last_seen = seen
 
             with state_lock:
                 state = payload
 
-        except Exception as e:
-            print("[Overlay ERROR]", e)
+        except Exception as exc:
+            log.error("listener error: %r", exc)
 
 
 class Overlay(QtWidgets.QWidget):
@@ -163,8 +177,8 @@ class Overlay(QtWidgets.QWidget):
         screen = QtWidgets.QApplication.primaryScreen().geometry()
         self.setGeometry(screen)
 
-        self.center_x = self.width() // 2
-        self.center_y = self.height() // 2
+        self.cx = self.width() // 2
+        self.cy = self.height() // 2
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -173,108 +187,94 @@ class Overlay(QtWidgets.QWidget):
         self.make_click_through()
 
     def make_click_through(self):
+        """Apply layered + transparent window styles so clicks pass through."""
         hwnd = int(self.winId())
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        ex_style |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        style |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, style)
 
     def tick(self):
         cleanup_popups()
         self.update()
 
-    def draw_arc(self, painter, radius, rel_angle, span_deg, color, pen_width):
+    def draw_arc(self, painter, radius, angle, span, color, width):
+        """Draw a single arc on the ring, centred on ``angle``."""
         rect = QtCore.QRectF(
-            self.center_x - radius,
-            self.center_y - radius,
+            self.cx - radius,
+            self.cy - radius,
             radius * 2,
-            radius * 2
+            radius * 2,
         )
 
-        start_deg = rel_angle - span_deg / 2 - 90
+        start = angle - span / 2 - 90
 
-        pen = QtGui.QPen(color, pen_width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+        pen = QtGui.QPen(color, width, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
         painter.setPen(pen)
-        painter.drawArc(
-            rect,
-            int(-start_deg * 16),
-            int(-span_deg * 16)
-        )
+        painter.drawArc(rect, int(-start * 16), int(-span * 16))
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
         with state_lock:
-            local_state = dict(state)
+            snap = dict(state)
 
-        heading = local_state.get("heading")
-        player = local_state.get("player", {})
-        enemies = local_state.get("enemies", [])
-        ts = local_state.get("timestamp", 0.0)
-        local_team = local_state.get("team")
+        heading = snap.get("heading")
+        player = snap.get("player", {})
+        enemies = snap.get("enemies", [])
+        ts = snap.get("timestamp", 0.0)
+        team = snap.get("team")
 
-        if heading is None or time.time() - ts > 1.0:
+        if heading is None or time.time() - ts > staleAfter:
             painter.end()
             return
 
-        # Guide ring at 25% transparency
-        guide_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, RING_ALPHA), 2)
-        painter.setPen(guide_pen)
-        painter.drawEllipse(
-            QtCore.QPoint(self.center_x, self.center_y),
-            RING_RADIUS,
-            RING_RADIUS
-        )
+        # Guide ring.
+        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, ringAlpha), 2)
+        painter.setPen(pen)
+        painter.drawEllipse(QtCore.QPoint(self.cx, self.cy), ringRadius, ringRadius)
 
-        px = player.get("x", 96)
-        py = player.get("y", 93)
-        enemy_team = guess_enemy_team(local_team)
-        enemy_rgb = TEAM_COLORS.get(enemy_team, (255, 255, 255))
+        px = player.get("x", home["x"])
+        py = player.get("y", home["y"])
+        rgb = teamColors.get(enemy_team(team), (255, 255, 255))
 
-        # Persistent enemy indicators
-        for enemy in enemies:
-            ind = enemy_to_indicator(enemy["x"], enemy["y"], px, py, heading)
-            color = QtGui.QColor(enemy_rgb[0], enemy_rgb[1], enemy_rgb[2], ind["alpha"])
-            self.draw_arc(
-                painter,
-                RING_RADIUS,
-                ind["relative_angle"],
-                ARC_SPAN_DEG,
-                color,
-                ind["pen_width"]
-            )
+        # Persistent enemy indicators.
+        for e in enemies:
+            arc = enemy_arc(e["x"], e["y"], px, py, heading)
+            color = QtGui.QColor(rgb[0], rgb[1], rgb[2], arc.alpha)
+            self.draw_arc(painter, ringRadius, arc.angle, ringSpan, color, arc.width)
 
-        # Popups
+        # Transient pop-ups for newly spotted enemies.
         now = time.time()
         with popup_lock:
-            active_popups = list(popups)
+            active = list(popups)
 
-        for popup in active_popups:
-            age = now - popup["created"]
-            t = 1.0 - clamp(age / POPUP_LIFETIME, 0.0, 1.0)
+        for p in active:
+            t = 1.0 - clamp((now - p["born"]) / popupLife, 0.0, 1.0)
 
-            rgb = TEAM_COLORS.get(popup["team"], (255, 255, 255))
+            c = teamColors.get(p["team"], (255, 255, 255))
             alpha = int(255 * t)
-            width = max(3, int(POPUP_PEN_WIDTH * (0.6 + 0.4 * t)))
+            width = max(3, int(popupPen * (0.6 + 0.4 * t)))
 
-            color = QtGui.QColor(rgb[0], rgb[1], rgb[2], alpha)
-            self.draw_arc(
-                painter,
-                POPUP_RADIUS,
-                popup["relative_angle"],
-                POPUP_SPAN_DEG,
-                color,
-                width
-            )
+            color = QtGui.QColor(c[0], c[1], c[2], alpha)
+            self.draw_arc(painter, popupRadius, p["angle"], popupSpan, color, width)
 
         painter.end()
 
 
-if __name__ == "__main__":
-    listener = threading.Thread(target=udp_listener, daemon=True)
-    listener.start()
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    )
+
+    threading.Thread(target=udp_listener, daemon=True).start()
 
     app = QtWidgets.QApplication([])
     overlay = Overlay()
     overlay.show()
     app.exec_()
+
+
+if __name__ == "__main__":
+    main()
